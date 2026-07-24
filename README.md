@@ -112,7 +112,7 @@ q_v
 ```math
 h^\star
 =
-\operatorname*{arg\,min}_{\operatorname{mean}(h)=0}
+\mathrm{arg\,min}_{\mathrm{mean}(h)=0}
 \left\lVert\nabla h-\mathbf q\right\rVert_2^2 .
 ```
 
