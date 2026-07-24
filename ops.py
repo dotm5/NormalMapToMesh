@@ -26,6 +26,7 @@
 #
 # 重复点"应用"= 从基面重建(幂等), 改倍数即所见即所得(全缓存命中, 只剩写回)。
 
+import threading
 import time
 
 import bpy
@@ -41,6 +42,18 @@ BAKE_SAMPLES = 1   # EMIT 烘焙无噪声, 1 采样足够(回退路径)
 # 运行期缓存(只认网格/材质"身份", 不追踪材质节点内容变化)
 _grad_cache = {}     # 前端结果: (gx, gy, wmap)
 _island_cache = {}
+_joint_cache = {}    # 联合求解结果: 未乘 disp_scale 的细分顶点标量位移
+_active_joint_job = None
+
+
+class _JointSolveRequest(RuntimeError):
+    """Detached NumPy inputs for a modal background solve."""
+
+    def __init__(self, cache_key, positional, keyword):
+        super().__init__("联合优化等待后台求解")
+        self.cache_key = cache_key
+        self.positional = positional
+        self.keyword = keyword
 
 
 def _cache_put(cache, key, val, cap=2):
@@ -51,8 +64,14 @@ def _cache_put(cache, key, val, cap=2):
 
 
 def clear_caches():
+    global _active_joint_job
+    if _active_joint_job is not None:
+        cancel_event = getattr(_active_joint_job, "_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
     _grad_cache.clear()
     _island_cache.clear()
+    _joint_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +104,54 @@ def _read_vert_cos(me):
     buf = np.empty(n * 3, np.float32)
     me.vertices.foreach_get("co", buf)
     return buf.reshape(-1, 3)
+
+
+def _optional_float_attribute(me, name, domain):
+    """Read an optional float attribute, treating absence as an empty array."""
+    attribute = me.attributes.get(name)
+    if (attribute is None or attribute.domain != domain
+            or attribute.data_type != 'FLOAT'):
+        return np.empty(0, np.float32)
+    values = np.empty(len(attribute.data), np.float32)
+    attribute.data.foreach_get("value", values)
+    return values
+
+
+def _joint_solution_cache_key(me, loop_uv, loop_vert, loop_total,
+                              gx, gy, wmap, level,
+                              position_weight, irls_iters):
+    """Exact cache key for an unscaled joint-optimization solution.
+
+    Unlike the interactive gradient cache, this key hashes complete content:
+    base geometry/topology, UVs, user creases, and the post-filter gradient
+    fields.  Reusing a million-vertex solution after a subtle edit would be far
+    worse than spending a fraction of a second hashing these arrays.
+    """
+    loop_edge = np.empty(len(me.loops), np.int32)
+    me.loops.foreach_get("edge_index", loop_edge)
+    edge_vert = np.empty(len(me.edges) * 2, np.int32)
+    me.edges.foreach_get("vertices", edge_vert)
+    geometry_digest = core.content_digest(
+        _read_vert_cos(me),
+        loop_vert,
+        loop_edge,
+        edge_vert,
+        loop_total,
+        loop_uv,
+        _optional_float_attribute(me, "crease_edge", 'EDGE'),
+        _optional_float_attribute(me, "crease_vert", 'POINT'),
+    )
+    gradient_digest = core.content_digest(gx, gy, wmap)
+    return (
+        "joint-solution-v1",
+        geometry_digest,
+        gradient_digest,
+        int(level),
+        float(position_weight),
+        int(irls_iters),
+        400,
+        1e-5,
+    )
 
 
 def _uv_fill(me, loop_uv):
@@ -784,11 +851,14 @@ def _bake_triple(context, obj, source, image, bake_size, loop_uv):
 # 岛界折痕锁定的 Catmull-Clark 极限曲面求值(拓扑与 multires 逐位一致, 实测)
 # ---------------------------------------------------------------------------
 
-def _island_border_edges(me, loop_uv, loop_vert, labels, loop_total):
-    """UV 岛边界边集合 + 其端点集合(折痕锁定目标)。
+def _island_border_edges(me, loop_uv, loop_vert, labels, loop_total,
+                         include_uv_seams=True):
+    """细分折痕边集合 + 其端点集合。
 
     边界 = 开放边/非流形边、两侧面属不同岛的边、两侧 UV 不连续的接缝边
-    (量化口径与 face_islands 一致)。返回 (edge_bool[E], vert_bool[V])。
+    (量化口径与 face_islands 一致)。联合优化模式传 ``include_uv_seams=False``：
+    只锁真实开放/非流形边，普通 UV 缝继续共享同一张 Catmull-Clark 曲面。
+    返回 (edge_bool[E], vert_bool[V])。
     """
     e_count = len(me.edges)
     l_count = len(me.loops)
@@ -804,7 +874,7 @@ def _island_border_edges(me, loop_uv, loop_vert, labels, loop_total):
     counts = np.bincount(le, minlength=e_count)
     border = counts != 2                       # 开放边/非流形边一律锁
     two_edges = np.flatnonzero(counts == 2)
-    if two_edges.size:
+    if include_uv_seams and two_edges.size:
         order = np.argsort(le, kind='stable')
         first = np.searchsorted(le[order], two_edges, side='left')
         l1 = order[first].astype(np.int64)
@@ -932,7 +1002,8 @@ def _auto_level(corner_count, texel_count, fill, quad_budget):
     return level
 
 
-def build(context, obj, s, report):
+def build(context, obj, s, report, *, defer_joint=False,
+          expected_joint_cache_key=None):
     """核心构建。s = 场景设置 PropertyGroup。异常直接抛出, 由 Operator 兜底。"""
     t0 = time.perf_counter()
     me = obj.data
@@ -955,7 +1026,11 @@ def build(context, obj, s, report):
             except Exception:
                 pass
     try:
-        _build_inner(context, obj, s, report, t0)
+        _build_inner(
+            context, obj, s, report, t0,
+            defer_joint=defer_joint,
+            expected_joint_cache_key=expected_joint_cache_key,
+        )
     finally:
         vl_objects = context.view_layer.objects
         for name in hidden_objs:
@@ -967,8 +1042,17 @@ def build(context, obj, s, report):
                     pass
 
 
-def _build_inner(context, obj, s, report, t0):
+def _build_inner(context, obj, s, report, t0, *,
+                 defer_joint=False, expected_joint_cache_key=None):
     me = obj.data
+    reconstruction_mode = getattr(s, "reconstruction_mode", 'POISSON')
+    joint_mode = reconstruction_mode == 'JOINT'
+    if expected_joint_cache_key is not None and not joint_mode:
+        raise RuntimeError(
+            "重建求解器在后台联合求解期间已改变；旧结果未应用，"
+            "请按当前设置重新点击“应用 / 更新”")
+    joint_position_weight = float(getattr(s, "joint_position_weight", 0.1))
+    joint_irls_iters = int(getattr(s, "joint_irls_iters", 3))
 
     source = _resolve_source(obj, s)
     loop_uv = _read_loop_uvs(me)
@@ -992,18 +1076,16 @@ def _build_inner(context, obj, s, report, t0):
     me.polygons.foreach_get("loop_total", loop_total)
     labels, n_islands = _get_island_labels(me, loop_vert, loop_uv, loop_total)
     border_edges, border_verts = _island_border_edges(me, loop_uv, loop_vert,
-                                                     labels, loop_total)
+                                                     labels, loop_total,
+                                                     include_uv_seams=not joint_mode)
 
-    # ---- Multires 修改器 ----
+    # ---- Multires 兼容性预检 ----
+    # 真正建层延后到求解成功之后：后台求解可取消，取消时不应先破坏已有细节。
     mod = _find_multires(obj)
     owned = bool(obj.get("nmtm_owned"))
     if mod is not None and mod.total_levels > 0 and not owned:
         raise RuntimeError(
             "物体已有带层级的 Multires(非本工具创建)。为防细节丢失请先应用或移除它。")
-    if mod is None:
-        mod = obj.modifiers.new("NormalMapToMesh", 'MULTIRES')
-    if obj.modifiers.find(mod.name) != 0:
-        bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=0)
 
     if s.auto_levels:
         level = _auto_level(len(me.loops), bake_size * bake_size, fill, s.quad_budget)
@@ -1014,7 +1096,7 @@ def _build_inner(context, obj, s, report, t0):
     level = max(1, level)
     quads = len(me.loops) * (4 ** (level - 1))
 
-    # ---- Neumann(镜像)积分 + 两级带限 ----
+    # ---- 两级带限 + 求解器输入 ----
     # ① 级别匹配重建滤波(采样理论): 顶点间线性插值要呈现平滑曲面, 内容波长须
     #    ≳6×顶点距——σ=1.5×texel/顶点距。旧 0.6 系数把内容钉在每级 ~3.75 采样/
     #    波长, 呈现恒为多边形折面感且各级观感相同("升级别不变光滑"的根源)。
@@ -1024,7 +1106,18 @@ def _build_inner(context, obj, s, report, t0):
     texels_per_edge = float(np.sqrt(bake_size * bake_size * fill / max(quads, 1)))
     sigma_sampling = 1.5 * texels_per_edge
     sigma_px = float(np.sqrt(float(s.detail_smooth_px) ** 2 + sigma_sampling ** 2))
-    field = core.integrate_height(gx, gy, smooth_sigma=sigma_px / bake_size)
+    if joint_mode:
+        # 联合优化不先生成全图高度：只对两个法线梯度分量做自由边界低通，随后
+        # 在真实细分拓扑上组装边位移观测。低模位置以 d=0 屏蔽项进入同一优化。
+        smooth_grad = core.smooth_fields_neumann(
+            np.stack([gx, gy], axis=-1), sigma_px / bake_size)
+        gx_work = smooth_grad[..., 0]
+        gy_work = smooth_grad[..., 1]
+        field = None
+    else:
+        # 传统兼容后端：Neumann(镜像)积分为 UV 高度场。
+        field = core.integrate_height(gx, gy, smooth_sigma=sigma_px / bake_size)
+        gx_work = gy_work = None
 
     # 开放边界(卡片边缘)衰减: 高度场沿 UV 距离场 smoothstep 归零。场量属于
     # 低模 UV 域, 与细分级别无关; 边界顶点另有硬锁零位移兜底
@@ -1032,34 +1125,35 @@ def _build_inner(context, obj, s, report, t0):
     if int(s.edge_falloff_px) > 0:
         seg = _open_edge_segments(me, loop_uv)
         if seg.shape[0]:
-            field = field * core.edge_falloff_field(seg, bake_size,
-                                                    int(s.edge_falloff_px))
+            falloff = core.edge_falloff_field(seg, bake_size,
+                                              int(s.edge_falloff_px))
+            if joint_mode:
+                gx_work *= falloff
+                gy_work *= falloff
+            else:
+                field *= falloff
             fall_stat = f" | 边缘衰减 {int(s.edge_falloff_px)}px/{seg.shape[0]:,}段"
-    print(f"[NormalMapToMesh] 梯度有效率 {wmap.mean():.1%} | "
-          f"高度场 p95 {np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰ | "
-          f"重建滤波 σ {sigma_sampling:.2f}px ⊕ 噪声地板 {float(s.detail_smooth_px):.1f}px"
-          f"{fall_stat}")
-
-    # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
-    # 层数已匹配则整段跳过(重建快路径); 建层在隐藏态跑——细分面从此只当
-    # reshape 的容器, 目标面统一来自 Subsurf 求值, 与建层时的插值源无关
-    if not (owned and mod.total_levels == level):
-        mod.show_viewport = False
-        try:
-            if mod.total_levels > 0:
-                mod.levels = 0
-                mod.sculpt_levels = 0
-                bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
-            for _ in range(level):
-                bpy.ops.object.multires_subdivide(modifier=mod.name, mode='CATMULL_CLARK')
-        finally:
-            mod.show_viewport = True
-    mod.levels = level
-    mod.sculpt_levels = level
-    mod.render_levels = level
-    if hasattr(mod, "uv_smooth"):
-        mod.uv_smooth = 'NONE'          # 最终对象 UV 与采样时的线性插值一致
-    t_subdiv = time.perf_counter()
+    joint_cache_key = None
+    if joint_mode:
+        joint_cache_key = _joint_solution_cache_key(
+            me, loop_uv, loop_vert, loop_total,
+            gx_work, gy_work, wmap, level,
+            joint_position_weight, joint_irls_iters)
+        if (expected_joint_cache_key is not None
+                and joint_cache_key != expected_joint_cache_key):
+            raise RuntimeError(
+                "模型、贴图或联合参数在后台求解期间已改变；"
+                "旧结果未应用，请重新点击“应用 / 更新”")
+        grad_mag = np.hypot(gx_work[wmap > 0], gy_work[wmap > 0])
+        field_stat = f"梯度幅值 p95 {np.percentile(grad_mag, 95):.4g}"
+        solver_label = "位置+法线联合优化"
+    else:
+        field_stat = (f"高度场 p95 "
+                      f"{np.percentile(np.abs(field[wmap > 0]), 95) * 1000:.2f}‰")
+        solver_label = "UV Neumann/Poisson"
+    print(f"[NormalMapToMesh] 求解器 {solver_label} | 梯度有效率 {wmap.mean():.1%} | "
+          f"{field_stat} | 重建滤波 σ {sigma_sampling:.2f}px "
+          f"⊕ 噪声地板 {float(s.detail_smooth_px):.1f}px{fall_stat}")
 
     # ---- 细分基面: 岛界折痕锁定 CC 极限曲面(Subsurf 求值副本, 拓扑与 multires
     #      逐位一致) ----
@@ -1071,11 +1165,13 @@ def _build_inner(context, obj, s, report, t0):
     tmp_obj = None
     tmp_me = None
     try:
-        mod.show_viewport = False
+        if mod is not None:
+            mod.show_viewport = False
         try:
             tmp_me = _subsurf_eval_mesh(context, obj, level, border_edges, border_verts)
         finally:
-            mod.show_viewport = True
+            if mod is not None:
+                mod.show_viewport = True
         t_eval = time.perf_counter()
 
         vcount = len(tmp_me.vertices)
@@ -1086,38 +1182,9 @@ def _build_inner(context, obj, s, report, t0):
         lv2 = _read_loop_verts(tmp_me)
         uv2 = _read_loop_uvs(tmp_me)
 
-        # 逐 loop 采样(高度 + 有效权重)。三次 B 样条(C2): 位移曲面继承采样核的
-        # 连续性——双线性的 C0 折面正是素模/雕刻视图"颗粒感"的来源
-        samp = np.stack([field, wmap], axis=-1)
-        s2 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
-        h_loop = s2[:, 0].astype(np.float32)
-        w_loop = (s2[:, 1] > 0.5).astype(np.float32)
-
-        # 基面拓扑映射: 细分面按基面连续分块 → 逐 loop 岛标签
-        per_face = loop_total.astype(np.int64) * (4 ** (level - 1))
-        island_of_loop2 = np.repeat(np.repeat(labels, per_face), 4)
-        if island_of_loop2.shape[0] != h_loop.shape[0]:
-            raise RuntimeError(
-                f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} vs {h_loop.shape[0]:,}")
-
-        h_loop = core.detrend_per_island(h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
-        h_loop = core.stitch_islands(h_loop, lv2, island_of_loop2, n_islands)
-        h_loop *= w_loop   # 无效采样(未覆盖背景)不位移
-        t_np1 = time.perf_counter()
-
-        # 位移方向 = 极限曲面自身的光滑法线场(极限采样网格的平滑顶点法线,
-        # O(顶点距²) 收敛): 位移是向量场作用于光滑曲面, 全网无折痕——平坦低模
-        # 的 Phong 插值场在每条基面边有 C0 折痕, h≠0 处会把线框浮雕进曲面
-        vn = np.empty(vcount * 3, np.float32)
-        tmp_me.vertex_normals.foreach_get("vector", vn)
-        n0_vert = vn.reshape(-1, 3)
-        n0_vert = n0_vert / np.maximum(np.linalg.norm(n0_vert, axis=1), 1e-12)[:, None]
-        h_vert = core.average_loops_to_verts(h_loop, lv2, vcount)
-        dvec = n0_vert * (h_vert * np.float32(s.disp_scale))[:, None]
-
         # 边界硬锁: 开放边界顶点(卡片边缘)位移严格归零——边缘偏移会把原本
-        # 贴合的卡片边撕出缝隙, 基面边缘本来就是对的; 平滑衰减带已在高度场
-        # UV 域完成(edge_falloff_px, 细分不变), 此处只做精确兜底
+        # 贴合的卡片边撕出缝隙。联合优化把它们直接从未知量消去；传统后端在
+        # 采样后硬锁。普通 UV 缝不在此集合中。
         ecount = len(tmp_me.edges)
         ev = np.empty(ecount * 2, np.int32)
         tmp_me.edges.foreach_get("vertices", ev)
@@ -1125,24 +1192,146 @@ def _build_inner(context, obj, s, report, t0):
         le = np.empty(len(tmp_me.loops), np.int32)
         tmp_me.loops.foreach_get("edge_index", le)
         edge_face_count = np.bincount(le, minlength=ecount)
-        boundary_verts = np.unique(ev[edge_face_count[:ecount] == 1].ravel())
+        boundary_verts = np.unique(ev[edge_face_count[:ecount] != 2].ravel())
+        pin_mask = np.zeros(vcount, bool)
+        pin_mask[boundary_verts] = True
+
+        # 位移方向 = 极限曲面自身的光滑法线场(极限采样网格的平滑顶点法线,
+        # O(顶点距²) 收敛): 位移是向量场作用于光滑曲面。
+        vn = np.empty(vcount * 3, np.float32)
+        tmp_me.vertex_normals.foreach_get("vector", vn)
+        n0_vert = vn.reshape(-1, 3)
+        n0_vert = n0_vert / np.maximum(np.linalg.norm(n0_vert, axis=1), 1e-12)[:, None]
+        co = _read_vert_cos(tmp_me)
+
+        if joint_mode:
+            cached_joint = _joint_cache.get(joint_cache_key)
+            cache_hit = (
+                cached_joint is not None
+                and cached_joint[0].shape == (vcount,)
+            )
+            if cache_hit:
+                h_vert, joint_stats = cached_joint
+                joint_stats = dict(joint_stats)
+                _cache_put(_joint_cache, joint_cache_key, cached_joint)
+            else:
+                # 法线梯度只作为每个细分面内边的位移差观测；顶点未知量按真实
+                # 网格共享，UV 缝/多岛不再产生独立高度常量，也无需 PLANE 去趋势。
+                poly_count2 = len(tmp_me.polygons)
+                loop_start2 = np.empty(poly_count2, np.int64)
+                loop_total2 = np.empty(poly_count2, np.int64)
+                tmp_me.polygons.foreach_get("loop_start", loop_start2)
+                tmp_me.polygons.foreach_get("loop_total", loop_total2)
+                edge_i, edge_j, target_delta, edge_weight = \
+                    core.gradient_constraints_from_loops(
+                        lv2, uv2, loop_start2, loop_total2,
+                        gx_work, gy_work, wmap, loop_edge=le)
+                if edge_i.size == 0:
+                    raise RuntimeError("联合优化没有有效的法线梯度边约束")
+                edge_vec = co[edge_j] - co[edge_i]
+                extent = np.ptp(co.astype(np.float64), axis=0)
+                reference_sq = max(float(np.dot(extent, extent)), 1e-20)
+                position_measure = (
+                    np.einsum("ij,ij->i", edge_vec, edge_vec) / reference_sq
+                ).astype(np.float32)
+                solve_positional = (
+                    edge_i, edge_j, target_delta, vcount)
+                solve_keyword = {
+                    "base_weight": edge_weight,
+                    "position_weight": joint_position_weight,
+                    "position_measure": position_measure,
+                    "pinned": pin_mask,
+                    "irls_iters": joint_irls_iters,
+                    "max_iter": 400,
+                    "tolerance": 1e-5,
+                }
+                if defer_joint:
+                    raise _JointSolveRequest(
+                        joint_cache_key, solve_positional, solve_keyword)
+                h_vert, joint_stats = core.solve_joint_position_normal(
+                    *solve_positional, **solve_keyword)
+                _cache_put(
+                    _joint_cache,
+                    joint_cache_key,
+                    (h_vert.copy(), dict(joint_stats)),
+                )
+            if not joint_stats["converged"]:
+                report({'WARNING'},
+                       f"联合优化 PCG 未在 400 次内完全收敛；已保留当前残差 "
+                       f"RMS={joint_stats['residual_rms']:.3g}")
+            solve_stat = (
+                f"联合约束 {joint_stats['edge_count']:,} | "
+                f"{'解缓存命中' if cache_hit else '新求解'} | "
+                f"PCG {joint_stats['pcg_iterations']} | "
+                f"IRLS {joint_stats['irls_updates']} | "
+                f"残差 p95 {joint_stats['residual_p95']:.3g} | "
+                f"降权 {joint_stats['downweighted_fraction']:.1%}")
+        else:
+            # 传统后端：逐 loop 采样 UV 高度，逐岛去趋势并缝合。
+            samp = np.stack([field, wmap], axis=-1)
+            s2 = core.sample_bspline_wrap(samp, uv2[:, 0], uv2[:, 1])
+            h_loop = s2[:, 0].astype(np.float32)
+            w_loop = (s2[:, 1] > 0.5).astype(np.float32)
+            per_face = loop_total.astype(np.int64) * (4 ** (level - 1))
+            island_of_loop2 = np.repeat(np.repeat(labels, per_face), 4)
+            if island_of_loop2.shape[0] != h_loop.shape[0]:
+                raise RuntimeError(
+                    f"细分拓扑映射失配: {island_of_loop2.shape[0]:,} "
+                    f"vs {h_loop.shape[0]:,}")
+            h_loop = core.detrend_per_island(
+                h_loop, uv2, island_of_loop2, n_islands, 'PLANE')
+            h_loop = core.stitch_islands(
+                h_loop, lv2, island_of_loop2, n_islands)
+            h_loop *= w_loop
+            h_vert = core.average_loops_to_verts(h_loop, lv2, vcount)
+            solve_stat = f"UV Poisson | {n_islands} 岛"
+        t_np1 = time.perf_counter()
+
+        # ---- 建层(只为 Multires 数据结构; reshape 会完整覆写 MDISPS) ----
+        # 求解成功后才创建/重建，确保后台取消不会损坏已有结果。层数已匹配则
+        # 整段跳过；隐藏态细分面只作为 reshape 容器。
+        if mod is None:
+            mod = obj.modifiers.new("NormalMapToMesh", 'MULTIRES')
+        if obj.modifiers.find(mod.name) != 0:
+            bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=0)
+        if not (owned and mod.total_levels == level):
+            mod.show_viewport = False
+            try:
+                if mod.total_levels > 0:
+                    mod.levels = 0
+                    mod.sculpt_levels = 0
+                    bpy.ops.object.multires_higher_levels_delete(
+                        modifier=mod.name)
+                for _ in range(level):
+                    bpy.ops.object.multires_subdivide(
+                        modifier=mod.name, mode='CATMULL_CLARK')
+            finally:
+                mod.show_viewport = True
+        mod.levels = level
+        mod.sculpt_levels = level
+        mod.render_levels = level
+        if hasattr(mod, "uv_smooth"):
+            mod.uv_smooth = 'NONE'
+        t_subdiv = time.perf_counter()
+
+        dvec = n0_vert * (h_vert * np.float32(s.disp_scale))[:, None]
         if boundary_verts.size:
             dvec[boundary_verts] = 0.0
         t_np2 = time.perf_counter()
 
-        co = _read_vert_cos(tmp_me)
         co += dvec
         tmp_me.vertices.foreach_set("co", co.ravel())
         tmp_me.update()
         mag = np.linalg.norm(dvec, axis=1)
-        disp_stat = (f"{n_islands} 岛 | 边界锁定 {boundary_verts.size:,} 顶点 | "
+        disp_stat = (f"{solve_stat} | 边界锁定 {boundary_verts.size:,} 顶点 | "
                      f"位移幅值 p50 {np.percentile(mag, 50) * 1000:.2f} / "
                      f"p95 {np.percentile(mag, 95) * 1000:.2f} / "
                      f"max {mag.max() * 1000:.2f} (千分之一物体单位)")
         t_displace = time.perf_counter()
-        print(f"[NormalMapToMesh] 位移明细: 建层 {t_subdiv - t_front:.1f}s"
-              f" + 基面求值 {t_eval - t_subdiv:.1f}s"
-              f" + 采样/岛处理 {t_np1 - t_eval:.1f}s + 锁边 {t_np2 - t_np1:.1f}s"
+        print(f"[NormalMapToMesh] 位移明细: 准备/基面 {t_eval - t_front:.1f}s"
+              f" + 约束/求解 {t_np1 - t_eval:.1f}s"
+              f" + 建层 {t_subdiv - t_np1:.1f}s"
+              f" + 锁边 {t_np2 - t_subdiv:.1f}s"
               f" + 写坐标 {t_displace - t_np2:.1f}s")
 
         # ---- reshape 写回 Multires 位移层 ----
@@ -1175,11 +1364,20 @@ def _build_inner(context, obj, s, report, t0):
     obj["nmtm_source"] = ("材质法线链" if source == 'MATERIAL'
                           else (s.image.name if s.image is not None else '?'))
     obj["nmtm_scale"] = float(s.disp_scale)
+    obj["nmtm_solver"] = solver_label
+    if joint_mode:
+        obj["nmtm_joint_position_weight"] = joint_position_weight
+        obj["nmtm_joint_irls_iters"] = joint_irls_iters
+    else:
+        for key in ("nmtm_joint_position_weight", "nmtm_joint_irls_iters"):
+            if key in obj:
+                del obj[key]
 
     t_end = time.perf_counter()
     msg = (f"{'材质' if source == 'MATERIAL' else '贴图'}求值 {bake_size}px | 级别 {level} | "
            f"{quads:,} 四边形 | {disp_stat} | "
-           f"前端 {t_front - t0:.1f}s + 建层 {t_subdiv - t_front:.1f}s + "
+           f"前端 {t_front - t0:.1f}s + 准备/求解 {t_np1 - t_front:.1f}s + "
+           f"建层 {t_subdiv - t_np1:.1f}s + "
            f"位移 {t_displace - t_subdiv:.1f}s + 写回 {t_end - t_displace:.1f}s "
            f"= {t_end - t0:.1f}s")
     print(f"[NormalMapToMesh] {obj.name}: {msg}")
@@ -1203,7 +1401,181 @@ class NMTM_OT_build(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return _poll_mesh(context)
+        return _poll_mesh(context) and _active_joint_job is None
+
+    def _start_worker(self, context, request):
+        global _active_joint_job
+        self._request = request
+        self._object_name = context.active_object.name_full
+        self._scene_name = context.scene.name_full
+        self._cancel_event = threading.Event()
+        self._cancel_requested = False
+        self._progress_done = 0
+        self._progress_total = (
+            (max(0, int(request.keyword.get("irls_iters", 0))) + 1)
+            * max(1, int(request.keyword.get("max_iter", 1)))
+        )
+        self._worker_state = {"done": False}
+        self._area = context.area
+        self._timer = context.window_manager.event_timer_add(
+            0.1, window=context.window)
+        context.window_manager.progress_begin(0, self._progress_total)
+        context.window_manager.modal_handler_add(self)
+        _active_joint_job = self
+
+        def progress(done, total):
+            self._progress_done = int(done)
+            self._progress_total = int(total)
+
+        def worker():
+            keyword = dict(request.keyword)
+            keyword["cancel_check"] = self._cancel_event.is_set
+            keyword["progress_callback"] = progress
+            try:
+                self._worker_state["result"] = \
+                    core.solve_joint_position_normal(
+                        *request.positional, **keyword)
+            except Exception as error:
+                self._worker_state["error"] = error
+            finally:
+                self._worker_state["done"] = True
+
+        self._thread = threading.Thread(
+            target=worker,
+            name="NormalMapToMesh-JointSolve",
+            daemon=True,
+        )
+        self._thread.start()
+        self.report(
+            {'INFO'}, "联合优化已在后台求解；Blender 可继续操作，按 Esc 取消")
+        return {'RUNNING_MODAL'}
+
+    def _finish_modal_ui(self, context):
+        global _active_joint_job
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            try:
+                context.window_manager.event_timer_remove(timer)
+            except Exception:
+                pass
+            self._timer = None
+        try:
+            context.window_manager.progress_end()
+        except Exception:
+            pass
+        area = getattr(self, "_area", None)
+        if area is not None:
+            try:
+                area.header_text_set(None)
+            except Exception:
+                pass
+        if _active_joint_job is self:
+            _active_joint_job = None
+
+    def invoke(self, context, _event):
+        # 后台/脚本执行保持同步、可复现；交互式联合模式把纯 NumPy PCG 放到
+        # 工作线程。所有 bpy 读取、Multires 建层与 reshape 仍在主线程。
+        if (getattr(context.scene.nmtm, "reconstruction_mode", 'POISSON')
+                != 'JOINT' or context.window is None):
+            return self.execute(context)
+        try:
+            build(
+                context,
+                context.active_object,
+                context.scene.nmtm,
+                self.report,
+                defer_joint=True,
+            )
+        except _JointSolveRequest as request:
+            return self._start_worker(context, request)
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC' and not self._cancel_requested:
+            self._cancel_requested = True
+            self._cancel_event.set()
+            self.report({'INFO'}, "正在取消联合优化…")
+            return {'RUNNING_MODAL'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        done = min(self._progress_done, self._progress_total)
+        try:
+            context.window_manager.progress_update(done)
+        except Exception:
+            pass
+        area = getattr(self, "_area", None)
+        if area is not None:
+            try:
+                percent = 100.0 * done / max(self._progress_total, 1)
+                area.header_text_set(
+                    f"NormalMapToMesh 联合优化 {percent:.0f}%"
+                    "（Esc 取消）")
+            except Exception:
+                pass
+
+        if not self._worker_state.get("done", False):
+            return {'RUNNING_MODAL'}
+
+        self._finish_modal_ui(context)
+        try:
+            self._thread.join(timeout=0.0)
+        except Exception:
+            pass
+
+        error = self._worker_state.get("error")
+        if self._cancel_requested or isinstance(
+                error, core.JointSolveCancelled):
+            self._request = None
+            self._worker_state = None
+            self.report({'INFO'}, "联合优化已取消，模型未修改")
+            return {'CANCELLED'}
+        if error is not None:
+            self._request = None
+            self._worker_state = None
+            self.report({'ERROR'}, f"联合优化失败: {error}")
+            return {'CANCELLED'}
+
+        result, stats = self._worker_state["result"]
+        _cache_put(
+            _joint_cache,
+            self._request.cache_key,
+            (result.copy(), dict(stats)),
+        )
+        obj = bpy.data.objects.get(self._object_name)
+        if (obj is None or context.scene.name_full != self._scene_name
+                or context.view_layer.objects.get(obj.name) is None):
+            self._request = None
+            self._worker_state = None
+            self.report(
+                {'ERROR'}, "后台求解完成，但原对象/场景已切换；结果未应用")
+            return {'CANCELLED'}
+        try:
+            build(
+                context,
+                obj,
+                context.scene.nmtm,
+                self.report,
+                expected_joint_cache_key=self._request.cache_key,
+            )
+        except Exception as build_error:
+            self.report({'ERROR'}, str(build_error))
+            return {'CANCELLED'}
+        finally:
+            self._request = None
+            self._worker_state = None
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        cancel_event = getattr(self, "_cancel_event", None)
+        if cancel_event is not None:
+            self._cancel_requested = True
+            cancel_event.set()
+        self._finish_modal_ui(context)
 
     def execute(self, context):
         s = context.scene.nmtm
@@ -1228,7 +1600,7 @@ class NMTM_OT_load_build(bpy.types.Operator, ImportHelper):
 
     @classmethod
     def poll(cls, context):
-        return _poll_mesh(context)
+        return _poll_mesh(context) and _active_joint_job is None
 
     def execute(self, context):
         s = context.scene.nmtm
@@ -1239,6 +1611,8 @@ class NMTM_OT_load_build(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
         s.image = img
         s.source = 'IMAGE'
+        if context.window is not None and s.reconstruction_mode == 'JOINT':
+            return bpy.ops.nmtm.build('INVOKE_DEFAULT')
         return bpy.ops.nmtm.build()
 
 
@@ -1251,7 +1625,8 @@ class NMTM_OT_remove(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return (_poll_mesh(context) and bool(obj.get("nmtm_owned"))
+        return (_active_joint_job is None
+                and _poll_mesh(context) and bool(obj.get("nmtm_owned"))
                 and _find_multires(obj) is not None)
 
     def execute(self, context):
@@ -1268,7 +1643,8 @@ class NMTM_OT_remove(bpy.types.Operator):
                 bpy.ops.object.multires_higher_levels_delete(modifier=mod.name)
             bpy.ops.object.modifier_remove(modifier=mod.name)
         for k in ("nmtm_owned", "nmtm_level", "nmtm_image", "nmtm_source",
-                  "nmtm_strength", "nmtm_scale"):
+                  "nmtm_strength", "nmtm_scale", "nmtm_solver",
+                  "nmtm_joint_position_weight", "nmtm_joint_irls_iters"):
             if k in obj.keys():
                 del obj[k]
         self.report({'INFO'}, "已恢复低模")

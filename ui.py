@@ -20,11 +20,27 @@ class NMTMSettings(bpy.types.PropertyGroup):
     image: PointerProperty(
         type=bpy.types.Image, name="法线贴图",
         description="贴图模式使用: 与当前网格 UV 对应的切线空间法线贴图")
+    reconstruction_mode: EnumProperty(
+        name="重建求解器",
+        items=(('POISSON', "UV Poisson（传统）",
+                "先在 UV 图集积分高度，再逐岛去趋势/缝合；兼容既有结果"),
+               ('JOINT', "位置 + 法线联合优化（实验）",
+                "在真实细分拓扑上联合最小化法线梯度误差与低模位置偏差；"
+                "UV 只负责采样，普通 UV 缝不再切断几何")),
+        default='POISSON')
     disp_scale: FloatProperty(
         name="高度倍数", default=1.0, soft_min=-3.0, soft_max=3.0, step=10, precision=2,
         description="1.0 = 按法线坡度积分出的物理高度(物体空间单位, 高频细节自动"
                     "获得与波长匹配的小高度)。完全平贴严格零位移(无整体膨胀), "
                     "凹凸随倾斜方向正负; 负值整体反向")
+    joint_position_weight: FloatProperty(
+        name="位置保持", default=0.1, min=0.0, soft_max=1.0, step=1, precision=3,
+        description="联合模式中低模位置先验的相对权重。越大越贴近细分后的低模基面，"
+                    "越小越服从法线坡度；0 仍保留极小数值锚定以消除常量自由度")
+    joint_irls_iters: IntProperty(
+        name="鲁棒迭代", default=3, min=0, max=8,
+        description="Huber IRLS 迭代次数，用于降低 UV 缝两侧冲突、压缩噪声和"
+                    "局部异常法线的影响；0=普通加权最小二乘")
     edge_falloff_px: IntProperty(
         name="边缘衰减 (px)", default=8, min=0, max=128,
         description="高度场向开放边界(卡片边缘)的 smoothstep 距离衰减半径"
@@ -76,6 +92,7 @@ class NMTM_PT_panel(bpy.types.Panel):
         layout.prop(s, "source", text="来源")
         if s.source != 'MATERIAL':
             layout.template_ID(s, "image", open="image.open")
+        layout.prop(s, "reconstruction_mode", text="求解器")
         layout.prop(s, "disp_scale", slider=True)
         row = layout.row()
         row.scale_y = 1.2
@@ -87,6 +104,12 @@ class NMTM_PT_panel(bpy.types.Panel):
         box.prop(s, "detail_smooth_px")
         box.prop(s, "deadzone_lsb")
         box.prop(s, "slope_limit")
+        if s.reconstruction_mode == 'JOINT':
+            joint = box.box()
+            joint.label(text="联合优化", icon='MOD_SMOOTH')
+            joint.label(text="首次 PCG 后台运行，可按 Esc 取消")
+            joint.prop(s, "joint_position_weight")
+            joint.prop(s, "joint_irls_iters")
         row = box.row()
         row.prop(s, "auto_levels")
         sub = row.row()
@@ -99,6 +122,7 @@ class NMTM_PT_panel(bpy.types.Panel):
             box = layout.box()
             box.label(text="当前状态", icon='CHECKMARK')
             box.label(text=f"来源: {obj.get('nmtm_source', obj.get('nmtm_image', '?'))}")
+            box.label(text=f"求解器: {obj.get('nmtm_solver', 'UV Neumann/Poisson')}")
             box.label(text=f"级别 {obj.get('nmtm_level', '?')} | "
                            f"倍数 {obj.get('nmtm_scale', 0.0):.2f}")
             box.operator("nmtm.remove", icon='TRASH')

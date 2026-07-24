@@ -18,7 +18,32 @@
 #   泄漏低频; 弯曲基面/细分网格离散法线引入细分方式依赖——shader 从不弯曲基面,
 #   位移场也从不该读细分网格自身的任何数据。
 
+import hashlib
+
 import numpy as np
+
+
+class JointSolveCancelled(RuntimeError):
+    """Raised when a caller cancels a long-running joint solve."""
+
+
+def content_digest(*arrays, digest_size=16):
+    """Return a deterministic digest over numeric array metadata and contents.
+
+    The joint-solution cache must invalidate on any geometry, topology, UV, or
+    gradient change.  ``hash()`` and sampled fingerprints are insufficient for
+    that purpose, so cache keys use this complete byte-level digest instead.
+    """
+    digest = hashlib.blake2b(digest_size=int(digest_size))
+    for value in arrays:
+        array = np.ascontiguousarray(np.asarray(value))
+        if array.dtype.hasobject:
+            raise TypeError("content_digest only supports non-object arrays")
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(np.asarray([array.ndim], dtype=np.int64).tobytes())
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(memoryview(array).cast("B"))
+    return digest.digest()
 
 # ---------------------------------------------------------------------------
 # 采样与解码
@@ -404,6 +429,412 @@ def integrate_height(gx, gy, smooth_sigma=0.0):
 
 
 # ---------------------------------------------------------------------------
+# 位置 + 法线联合优化（实验）
+# ---------------------------------------------------------------------------
+
+
+def smooth_fields_neumann(fields, smooth_sigma):
+    """自由边界高斯低通；fields 为 (H,W) 或 (H,W,C)，sigma 使用 UV 单位。
+
+    每个标量分量作半样本偶镜像后 FFT 滤波，等价于自由边界上的 DCT 高斯滤波。
+    与 ``integrate_height`` 中梯度的奇/偶镜像不同：这里平滑的是已经装配好的标量
+    梯度分量，偶镜像可保持常量坡度，不会在图集边缘人为压向零。
+    """
+    src = np.asarray(fields, dtype=np.float32)
+    if smooth_sigma <= 0.0:
+        return src.copy()
+    squeeze = src.ndim == 2
+    if squeeze:
+        src = src[..., None]
+    if src.ndim != 3:
+        raise ValueError("fields 必须是 (H,W) 或 (H,W,C)")
+
+    h, w, channels = src.shape
+    wx = (2.0 * np.pi) * np.fft.rfftfreq(2 * w, d=1.0 / w)
+    wy = (2.0 * np.pi) * np.fft.fftfreq(2 * h, d=1.0 / h)
+    filt = np.exp(-0.5 * float(smooth_sigma) ** 2
+                  * (wx[None, :] ** 2 + wy[:, None] ** 2))
+    out = np.empty_like(src)
+    # 逐通道处理，避免同时保留 C 份 complex128 频谱。
+    for channel in range(channels):
+        ext = np.empty((2 * h, 2 * w), np.float32)
+        ext[:h, :w] = src[..., channel]
+        ext[:h, w:] = src[:, ::-1, channel]
+        ext[h:] = ext[:h][::-1]
+        spec = np.fft.rfft2(ext)
+        del ext
+        spec *= filt
+        out[..., channel] = np.fft.irfft2(spec, s=(2 * h, 2 * w))[:h, :w]
+    return out[..., 0] if squeeze else out
+
+
+def _merge_duplicate_edge_observations(vert_i, vert_j, target, weight,
+                                       uv_i, uv_j, edge_id):
+    """精确合并普通流形边的双面重复观测，UV 缝观测保持独立。
+
+    细分面逐 loop 装配时，普通内部边会从相邻两面各出现一次。两条观测在统一
+    到 ``min(vertex) -> max(vertex)`` 的方向后，若 UV 端点与目标值完全相同，
+    它们在最小二乘和 Huber IRLS 中是同一残差的重复项，可把权重相加而不改变
+    目标函数。UV 缝、非流形边和任何不完全相同的观测都保留原样。
+    """
+    vi = np.asarray(vert_i, dtype=np.int64).ravel()
+    vj = np.asarray(vert_j, dtype=np.int64).ravel()
+    gd = np.asarray(target, dtype=np.float32).ravel()
+    bw = np.asarray(weight, dtype=np.float32).ravel()
+    ui = np.asarray(uv_i, dtype=np.float32)
+    uj = np.asarray(uv_j, dtype=np.float32)
+    eid = np.asarray(edge_id, dtype=np.int64).ravel()
+    if not (vi.size == vj.size == gd.size == bw.size == eid.size):
+        raise ValueError("重复边观测数组长度不一致")
+    if vi.size < 2:
+        return vi, vj, gd, bw
+
+    swap = vi > vj
+    low = np.minimum(vi, vj)
+    high = np.maximum(vi, vj)
+    canonical_target = np.where(swap, -gd, gd).astype(np.float32, copy=False)
+    valid_edge_id = eid >= 0
+    if not np.any(valid_edge_id):
+        return low, high, canonical_target, bw
+
+    edge_count = int(eid[valid_edge_id].max()) + 1
+    counts = np.bincount(eid[valid_edge_id], minlength=edge_count)
+    pair_edges = np.flatnonzero(counts == 2)
+    if pair_edges.size == 0:
+        return low, high, canonical_target, bw
+
+    # Blender 已提供 loop.edge_index；用 O(E) 的 first/last 归并，不对百万级
+    # 约束做 O(E log E) 全量排序。int32 足以容纳 Blender 的 loop 数并减少峰值内存。
+    positions = np.arange(vi.size, dtype=np.int32)
+    first = np.full(edge_count, vi.size, dtype=np.int32)
+    last = np.full(edge_count, -1, dtype=np.int32)
+    np.minimum.at(first, eid[valid_edge_id], positions[valid_edge_id])
+    np.maximum.at(last, eid[valid_edge_id], positions[valid_edge_id])
+    pair_first = first[pair_edges].astype(np.int64, copy=False)
+    pair_second = last[pair_edges].astype(np.int64, copy=False)
+
+    first_low_uv = np.where(
+        swap[pair_first, None], uj[pair_first], ui[pair_first])
+    first_high_uv = np.where(
+        swap[pair_first, None], ui[pair_first], uj[pair_first])
+    second_low_uv = np.where(
+        swap[pair_second, None], uj[pair_second], ui[pair_second])
+    second_high_uv = np.where(
+        swap[pair_second, None], ui[pair_second], uj[pair_second])
+    same_uv = (
+        np.all(first_low_uv == second_low_uv, axis=1)
+        & np.all(first_high_uv == second_high_uv, axis=1)
+    )
+    same_target = (
+        canonical_target[pair_first] == canonical_target[pair_second]
+    )
+    merge_first = pair_first[same_uv & same_target]
+    merge_second = pair_second[same_uv & same_target]
+    if merge_first.size == 0:
+        return low, high, canonical_target, bw
+
+    keep = np.ones(low.size, dtype=bool)
+    bw[merge_first] += bw[merge_second]
+    keep[merge_second] = False
+    return (low[keep], high[keep], canonical_target[keep], bw[keep])
+
+
+def gradient_constraints_from_loops(loop_vert, loop_uv, loop_start, loop_total,
+                                    gx, gy, weight_map, min_weight=0.05,
+                                    merge_duplicates=True, loop_edge=None):
+    """把法线导出的 UV 梯度变成真实网格拓扑上的边位移观测。
+
+    对每个面内有向边 ``i→j``，在 UV 中点采样 ``dh/du, dh/dv``，得到
+    ``d_j-d_i ≈ gx·Δu + gy·Δv``。同一几何边在 UV 缝两侧会保留两条独立观测，
+    但二者共享同一对顶点未知量；UV 因此只负责采样，不再定义几何连通性。
+    """
+    lv = np.asarray(loop_vert, dtype=np.int64)
+    uv = np.asarray(loop_uv, dtype=np.float32)
+    starts = np.asarray(loop_start, dtype=np.int64)
+    totals = np.asarray(loop_total, dtype=np.int64)
+    if lv.ndim != 1 or uv.shape != (lv.size, 2):
+        raise ValueError("loop_vert/loop_uv 形状不匹配")
+    if starts.shape != totals.shape:
+        raise ValueError("loop_start/loop_total 形状不匹配")
+    if lv.size == 0:
+        empty_i = np.zeros(0, np.int64)
+        empty_f = np.zeros(0, np.float32)
+        return empty_i, empty_i.copy(), empty_f, empty_f.copy()
+
+    nxt = np.arange(lv.size, dtype=np.int64) + 1
+    last = starts + totals - 1
+    nxt[last] = starts
+    vi = lv
+    vj = lv[nxt]
+    duv = uv[nxt].astype(np.float64) - uv.astype(np.float64)
+    mid = (uv[nxt].astype(np.float64) + uv.astype(np.float64)) * 0.5
+
+    packed = np.stack([gx, gy, weight_map], axis=-1).astype(np.float32)
+    obs = sample_bspline_wrap(packed, mid[:, 0].astype(np.float32),
+                              mid[:, 1].astype(np.float32))
+    target = obs[:, 0].astype(np.float64) * duv[:, 0] \
+        + obs[:, 1].astype(np.float64) * duv[:, 1]
+    weight = np.clip(obs[:, 2].astype(np.float64), 0.0, 1.0)
+    valid = ((vi != vj) & np.isfinite(target) & np.isfinite(weight)
+             & (weight >= float(min_weight)))
+    vi_valid = vi[valid].astype(np.int64)
+    vj_valid = vj[valid].astype(np.int64)
+    target_valid = target[valid].astype(np.float32)
+    weight_valid = weight[valid].astype(np.float32)
+    if not merge_duplicates or loop_edge is None:
+        return vi_valid, vj_valid, target_valid, weight_valid
+    edge_id = np.asarray(loop_edge, dtype=np.int64).ravel()
+    if edge_id.size != lv.size:
+        raise ValueError("loop_edge 长度与 loop 数不一致")
+    return _merge_duplicate_edge_observations(
+        vi_valid, vj_valid, target_valid, weight_valid,
+        uv[valid], uv[nxt][valid], edge_id[valid])
+
+
+def solve_joint_position_normal(edge_i, edge_j, target_delta, vert_count,
+                                base_weight=None, position_weight=0.1,
+                                position_measure=None, pinned=None, prior=None,
+                                irls_iters=3,
+                                max_iter=400, tolerance=1e-5,
+                                cancel_check=None, progress_callback=None):
+    """位置先验 + 法线梯度约束的矩阵自由标量位移优化。
+
+    求解::
+
+        Σ_e w_e ρ((d_j-d_i)-g_e) + λ Σ_i (d_i-d_prior_i)^2
+
+    ``g_e`` 来自法线贴图梯度沿真实网格边 UV 方向的线积分。固定 IRLS 权重时，
+    系统是带位置屏蔽项的加权图拉普拉斯；使用纯 NumPy PCG，不依赖 SciPy。
+    ``position_measure`` 可为每条边提供归一化后的局部面积尺度（通常取细分边长
+    平方/物体包围盒对角线平方）；位置项使用顶点相邻边尺度的加权均值，因此增加
+    细分级别不会让同一个 ``position_weight`` 越来越强。未提供时保留无量纲图权重。
+    ``pinned`` 顶点从未知量中消去（通常为真实开放边界），不会把 UV 缝当边界。
+    ``cancel_check`` 与 ``progress_callback`` 只接触 Python/NumPy 数据，可安全由
+    Blender 的后台工作线程使用；回调不得访问 bpy。
+    """
+    outer_count = max(0, int(irls_iters)) + 1
+    inner_budget = max(1, int(max_iter))
+    progress_total = outer_count * inner_budget
+
+    def check_cancelled():
+        if cancel_check is not None and cancel_check():
+            raise JointSolveCancelled("联合优化已取消")
+
+    def report_progress(done):
+        if progress_callback is not None:
+            progress_callback(int(done), int(progress_total))
+
+    check_cancelled()
+    n_vert = int(vert_count)
+    if n_vert < 0:
+        raise ValueError("vert_count 不能为负")
+    ei = np.asarray(edge_i, dtype=np.int64).ravel()
+    ej = np.asarray(edge_j, dtype=np.int64).ravel()
+    gd = np.asarray(target_delta, dtype=np.float64).ravel()
+    if not (ei.size == ej.size == gd.size):
+        raise ValueError("边约束数组长度不一致")
+    if base_weight is None:
+        bw = np.ones(ei.size, np.float64)
+    else:
+        bw = np.asarray(base_weight, dtype=np.float64).ravel()
+        if bw.size != ei.size:
+            raise ValueError("base_weight 长度不一致")
+    if position_measure is None:
+        pm = None
+    else:
+        pm = np.asarray(position_measure, dtype=np.float64).ravel()
+        if pm.size != ei.size:
+            raise ValueError("position_measure 长度不一致")
+    if pinned is None:
+        pin = np.zeros(n_vert, bool)
+    else:
+        pin = np.asarray(pinned, dtype=bool).ravel()
+        if pin.size != n_vert:
+            raise ValueError("pinned 长度不一致")
+    if prior is None:
+        prior_all = np.zeros(n_vert, np.float64)
+    else:
+        prior_all = np.asarray(prior, dtype=np.float64).ravel()
+        if prior_all.size != n_vert:
+            raise ValueError("prior 长度不一致")
+
+    valid = ((ei >= 0) & (ei < n_vert) & (ej >= 0) & (ej < n_vert)
+             & (ei != ej) & np.isfinite(gd) & np.isfinite(bw) & (bw > 0.0))
+    if pm is not None:
+        valid &= np.isfinite(pm) & (pm > 0.0)
+    ei, ej, gd, bw = ei[valid], ej[valid], gd[valid], bw[valid]
+    if pm is not None:
+        pm = pm[valid]
+    free_verts = np.flatnonzero(~pin)
+    if free_verts.size == 0:
+        report_progress(progress_total)
+        return prior_all.astype(np.float32), {
+            "edge_count": int(ei.size), "free_count": 0, "pcg_iterations": 0,
+            "irls_updates": 0, "converged": True, "residual_rms": 0.0,
+            "residual_p95": 0.0, "downweighted_fraction": 0.0,
+        }
+    free_map = np.full(n_vert, -1, np.int64)
+    free_map[free_verts] = np.arange(free_verts.size, dtype=np.int64)
+    fi = free_map[ei]
+    fj = free_map[ej]
+    keep = (fi >= 0) | (fj >= 0)
+    fi, fj, gd, bw = fi[keep], fj[keep], gd[keep], bw[keep]
+    if pm is not None:
+        pm = pm[keep]
+    if gd.size == 0:
+        report_progress(progress_total)
+        return prior_all.astype(np.float32), {
+            "edge_count": 0, "free_count": int(free_verts.size), "pcg_iterations": 0,
+            "irls_updates": 0, "converged": True, "residual_rms": 0.0,
+            "residual_p95": 0.0, "downweighted_fraction": 0.0,
+        }
+
+    has_i = fi >= 0
+    has_j = fj >= 0
+    n_free = free_verts.size
+    # 固定端点可能有非零 prior。把它对边差的常量贡献移到观测右端，使通用 API
+    # 与当前常用的零边界固定都严格成立。
+    pinned_difference = np.zeros(gd.size, np.float64)
+    pin_i = ~has_i
+    pin_j = ~has_j
+    if np.any(pin_i):
+        pinned_difference[pin_i] -= prior_all[ei[keep][pin_i]]
+    if np.any(pin_j):
+        pinned_difference[pin_j] += prior_all[ej[keep][pin_j]]
+    effective_target = gd - pinned_difference
+    # 用一个固定为零的哑元表示 pinned 端点。相比每次 SpMV 都布尔筛选并复制
+    # 约 200 万条边的 values，此布局只做连续 gather/bincount，显著降低 PCG
+    # 内层的临时数组与内存带宽。
+    dummy = n_free
+    fi_safe = np.where(has_i, fi, dummy)
+    fj_safe = np.where(has_j, fj, dummy)
+    extended = np.empty(n_free + 1, np.float64)
+
+    def difference(x):
+        extended[:-1] = x
+        extended[-1] = 0.0
+        out = extended[fj_safe]
+        out -= extended[fi_safe]
+        return out
+
+    def transpose(values):
+        out = np.bincount(fj_safe, weights=values, minlength=n_free + 1)
+        out -= np.bincount(fi_safe, weights=values, minlength=n_free + 1)
+        return out[:-1]
+
+    degree0_all = np.bincount(fi_safe, weights=bw, minlength=n_free + 1)
+    degree0_all += np.bincount(fj_safe, weights=bw, minlength=n_free + 1)
+    degree0 = degree0_all[:-1]
+    positive_degree = degree0[degree0 > 0.0]
+    degree_scale = float(np.median(positive_degree)) if positive_degree.size else 1.0
+    if pm is None:
+        position_mass = np.full(n_free, degree_scale, np.float64)
+    else:
+        mass_weight = bw * pm
+        mass_sum_all = np.bincount(
+            fi_safe, weights=mass_weight, minlength=n_free + 1)
+        mass_sum_all += np.bincount(
+            fj_safe, weights=mass_weight, minlength=n_free + 1)
+        mass_sum = mass_sum_all[:-1]
+        position_mass = mass_sum / np.maximum(degree0, 1e-30)
+        positive_mass = position_mass[position_mass > 0.0]
+        fallback_mass = float(np.median(positive_mass)) if positive_mass.size else 1.0
+        position_mass = np.where(position_mass > 0.0, position_mass, fallback_mass)
+    screen = max(float(position_weight), 0.0) * position_mass
+    numerical_screen = max(degree_scale, 1.0) * 1e-12
+    total_screen = screen + numerical_screen
+    prior_free = prior_all[free_verts]
+
+    x = prior_free.copy()
+    robust = np.ones(gd.size, np.float64)
+    total_pcg = 0
+    converged = False
+    updates_done = 0
+    final_residual = difference(x) - effective_target
+
+    for outer in range(outer_count):
+        check_cancelled()
+        weights = bw * robust
+        degree_all = np.bincount(
+            fi_safe, weights=weights, minlength=n_free + 1)
+        degree_all += np.bincount(
+            fj_safe, weights=weights, minlength=n_free + 1)
+        degree = degree_all[:-1]
+        diagonal = np.maximum(degree + total_screen, 1e-20)
+        rhs = transpose(weights * effective_target) + total_screen * prior_free
+
+        def apply(value):
+            return transpose(weights * difference(value)) + total_screen * value
+
+        residual = rhs - apply(x)
+        rhs_norm = max(float(np.linalg.norm(rhs)), 1.0)
+        z = residual / diagonal
+        direction = z.copy()
+        rz = float(np.dot(residual, z))
+        converged = float(np.linalg.norm(residual)) <= float(tolerance) * rhs_norm
+        pcg_used = 0
+        for iteration in range(inner_budget):
+            if iteration % 8 == 0:
+                check_cancelled()
+                report_progress(outer * inner_budget + iteration)
+            if converged or rz <= 0.0:
+                break
+            ad = apply(direction)
+            denom = float(np.dot(direction, ad))
+            if not np.isfinite(denom) or denom <= 1e-30:
+                break
+            alpha = rz / denom
+            x += alpha * direction
+            residual -= alpha * ad
+            pcg_used = iteration + 1
+            if float(np.linalg.norm(residual)) <= float(tolerance) * rhs_norm:
+                converged = True
+                break
+            z = residual / diagonal
+            rz_new = float(np.dot(residual, z))
+            if not np.isfinite(rz_new) or rz_new <= 0.0:
+                break
+            direction = z + (rz_new / rz) * direction
+            rz = rz_new
+        total_pcg += pcg_used
+        report_progress((outer + 1) * inner_budget)
+        final_residual = difference(x) - effective_target
+
+        if outer >= outer_count - 1:
+            break
+        abs_residual = np.abs(final_residual)
+        sigma = 1.4826 * float(np.median(abs_residual))
+        reference = max(float(np.median(np.abs(effective_target))), 1e-12)
+        if not np.isfinite(sigma) or sigma <= reference * 1e-8:
+            break
+        delta = 1.345 * sigma
+        new_robust = np.minimum(1.0, delta / np.maximum(abs_residual, 1e-30))
+        updates_done += 1
+        if np.max(np.abs(new_robust - robust)) < 1e-3:
+            robust = new_robust
+            break
+        robust = new_robust
+
+    result = prior_all.copy()
+    result[free_verts] = x
+    result[pin] = prior_all[pin]
+    abs_final = np.abs(final_residual)
+    stats = {
+        "edge_count": int(gd.size),
+        "free_count": int(n_free),
+        "pcg_iterations": int(total_pcg),
+        "irls_updates": int(updates_done),
+        "converged": bool(converged),
+        "residual_rms": float(np.sqrt(np.mean(final_residual ** 2))),
+        "residual_p95": float(np.percentile(abs_final, 95)),
+        "downweighted_fraction": float(np.mean(robust < 0.999)),
+        "position_screen_median": float(np.median(screen)),
+    }
+    report_progress(progress_total)
+    return result.astype(np.float32), stats
+
+
+# ---------------------------------------------------------------------------
 # UV 岛: 面级并查集 + 逐岛去趋势 + 岛间缝合 (v1 机器, 实测自洽)
 # ---------------------------------------------------------------------------
 
@@ -772,13 +1203,103 @@ def _selftest():
     assert abs(out3[2] - out3[1]) < 1e-3 and abs(out3[4] - out3[3]) < 1e-3
     print("[缝合] 岛间台阶对齐通过")
 
+    # ---- 位置 + 法线联合优化 ----
+    # 规则网格上的已知位移，其每条边差分是精确的法线梯度观测；固定一个顶点后应
+    # 无需 UV 全局积分即可恢复同一位移。随后注入单条强离群观测，Huber IRLS
+    # 应比普通最小二乘更接近真值。
+    ny, nx = 18, 24
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    truth = (0.03 * np.sin(2 * np.pi * xx / (nx - 1))
+             * np.cos(2 * np.pi * yy / (ny - 1)))
+    truth -= truth.ravel()[0]
+    ids = np.arange(nx * ny).reshape(ny, nx)
+    edge_i = np.concatenate([ids[:, :-1].ravel(), ids[:-1, :].ravel()])
+    edge_j = np.concatenate([ids[:, 1:].ravel(), ids[1:, :].ravel()])
+    target = truth.ravel()[edge_j] - truth.ravel()[edge_i]
+    pin = np.zeros(nx * ny, bool)
+    pin[0] = True
+    solved, joint_stats = solve_joint_position_normal(
+        edge_i, edge_j, target, nx * ny, position_weight=0.0, pinned=pin,
+        irls_iters=0, max_iter=2000, tolerance=1e-10)
+    joint_rms = np.sqrt(np.mean((solved.astype(np.float64) - truth.ravel()) ** 2))
+    assert joint_rms < 2e-6, f"联合优化精确场恢复失败: {joint_rms}"
+
+    target_bad = target.copy()
+    target_bad[target_bad.size // 3] += 0.5
+    solved_ls, _ = solve_joint_position_normal(
+        edge_i, edge_j, target_bad, nx * ny, position_weight=0.001, pinned=pin,
+        irls_iters=0, max_iter=2000, tolerance=1e-9)
+    solved_robust, robust_stats = solve_joint_position_normal(
+        edge_i, edge_j, target_bad, nx * ny, position_weight=0.001, pinned=pin,
+        irls_iters=5, max_iter=2000, tolerance=1e-9)
+    ls_rms = np.sqrt(np.mean((solved_ls.astype(np.float64) - truth.ravel()) ** 2))
+    robust_rms = np.sqrt(np.mean((solved_robust.astype(np.float64) - truth.ravel()) ** 2))
+    assert robust_rms < ls_rms * 0.5, \
+        f"IRLS 未能限制离群误差: {robust_rms} vs {ls_rms}"
+    assert robust_stats["downweighted_fraction"] > 0.0
+
+    # 位置项必须随细分边面积缩放；同一连续场加密一倍后，屏蔽强度不应暴涨。
+    def screened_amplitude(grid_y, grid_x):
+        sy, sx = np.mgrid[0:grid_y, 0:grid_x]
+        known = (0.03 * np.sin(2 * np.pi * sx / (grid_x - 1))
+                 * np.cos(2 * np.pi * sy / (grid_y - 1)))
+        grid_ids = np.arange(grid_x * grid_y).reshape(grid_y, grid_x)
+        si = np.concatenate(
+            [grid_ids[:, :-1].ravel(), grid_ids[:-1, :].ravel()])
+        sj = np.concatenate(
+            [grid_ids[:, 1:].ravel(), grid_ids[1:, :].ravel()])
+        sd = known.ravel()[sj] - known.ravel()[si]
+        measure = np.concatenate([
+            np.full(grid_y * (grid_x - 1), (1.0 / (grid_x - 1)) ** 2 / 2.0),
+            np.full((grid_y - 1) * grid_x, (1.0 / (grid_y - 1)) ** 2 / 2.0),
+        ])
+        estimate, _ = solve_joint_position_normal(
+            si, sj, sd, grid_x * grid_y, position_weight=10.0,
+            position_measure=measure, irls_iters=0,
+            max_iter=2000, tolerance=1e-10)
+        return float(np.dot(estimate, known.ravel())
+                     / np.dot(known.ravel(), known.ravel()))
+
+    amp_coarse = screened_amplitude(18, 24)
+    amp_fine = screened_amplitude(36, 48)
+    assert abs(amp_coarse - amp_fine) < 0.02, \
+        f"位置先验随细分级别漂移: {amp_coarse} vs {amp_fine}"
+
+    # 非零固定位置也应正确移入右端，而不是被隐式当作 0。
+    nonzero_pin, _ = solve_joint_position_normal(
+        np.array([0]), np.array([1]), np.array([2.0]), 2,
+        position_weight=0.0, pinned=np.array([True, False]),
+        prior=np.array([3.0, 5.0]), irls_iters=0,
+        max_iter=32, tolerance=1e-12)
+    assert np.allclose(nonzero_pin, [3.0, 5.0], atol=1e-7)
+
+    # 梯度平滑应精确保留常量坡度；单个四边面的面内边观测应匹配解析积分。
+    const_grad = np.full((32, 32, 2), [0.7, -0.2], np.float32)
+    const_smooth = smooth_fields_neumann(const_grad, 0.04)
+    assert np.abs(const_smooth - const_grad).max() < 1e-6
+    quad_lv = np.array([0, 1, 2, 3], np.int64)
+    quad_uv = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+    quad_gx = np.full((16, 16), 0.7, np.float32)
+    quad_gy = np.full((16, 16), -0.2, np.float32)
+    quad_w = np.ones((16, 16), np.float32)
+    qi, qj, qd, qw = gradient_constraints_from_loops(
+        quad_lv, quad_uv, np.array([0]), np.array([4]),
+        quad_gx, quad_gy, quad_w, merge_duplicates=False)
+    assert np.array_equal(qi, [0, 1, 2, 3]) and np.array_equal(qj, [1, 2, 3, 0])
+    assert np.allclose(qd, [0.7, -0.2, -0.7, 0.2], atol=1e-6)
+    assert np.allclose(qw, 1.0)
+    print(f"[联合优化] 精确场 RMS {joint_rms:.2e} | "
+          f"离群 LS/IRLS {ls_rms:.2e}/{robust_rms:.2e} | "
+          f"屏蔽幅值 粗/细 {amp_coarse:.3f}/{amp_fine:.3f} | "
+          f"PCG {joint_stats['pcg_iterations']} iter")
+
     # ---- 顶点归并 ----
     lv = np.array([0, 1, 1], np.int32)
     avg = average_loops_to_verts(np.array([1.0, 2.0, 4.0], np.float32), lv, 2)
     assert np.allclose(avg, [1.0, 3.0])
     print("[顶点平均] 标量归并通过")
 
-    print("core.py 自测全部通过 ✓")
+    print("[OK] core.py 自测全部通过")
 
 
 if __name__ == "__main__":
